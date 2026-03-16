@@ -6,7 +6,7 @@
 
 ## Table of Contents
 
-- [What's New in v3.1.0](#whats-new-in-v310)
+- [What's New in v1.1.0](#whats-new-in-v310)
 - [Features](#features)
 - [Platform Compatibility](#platform-compatibility)
 - [Requirements](#requirements)
@@ -27,7 +27,7 @@
 
 ---
 
-## What's New in v3.1.0
+## What's New in v1.1.0
 
 This release is a significant cross-platform hardening update. The core functionality is unchanged, but the script now runs reliably across a much wider range of systems.
 

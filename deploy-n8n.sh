@@ -23,7 +23,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ─── Script metadata ──────────────────────────────────────────────────────────
-readonly SCRIPT_VERSION="3.1.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 
 # ─── Defaults (TIMEZONE resolved after platform-detection functions load) ─────
