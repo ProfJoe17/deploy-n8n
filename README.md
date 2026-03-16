@@ -1,12 +1,14 @@
 # deploy-n8n
 
-> A single-file Bash deployment manager for [n8n](https://n8n.io) that spins up n8n **plus** its external Python/JS task-runner sidecar via Docker Compose — with version management, automated backups, live log tailing, and more.
+> A single-file Bash deployment manager for [n8n](https://n8n.io) that spins up n8n **plus** its external Python/JS task-runner sidecar via Docker Compose — with cross-platform support, version management, automated backups, live log tailing, and more.
 
 ---
 
 ## Table of Contents
 
+- [What's New in v3.1.0](#whats-new-in-v310)
 - [Features](#features)
+- [Platform Compatibility](#platform-compatibility)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
 - [Commands](#commands)
@@ -25,38 +27,114 @@
 
 ---
 
+## What's New in v3.1.0
+
+This release is a significant cross-platform hardening update. The core functionality is unchanged, but the script now runs reliably across a much wider range of systems.
+
+**Platform detection & install hints**
+- Detects 20+ Linux distributions and macOS by reading `/etc/os-release`, legacy release files, and `$OSTYPE`/`uname`
+- Every missing-dependency error now prints the correct install command for your distro (apt, dnf/yum, zypper, pacman, apk, xbps, emerge, slackpkg, nix-env, eopkg, brew)
+
+**Timezone auto-detection (5 strategies)**
+- `/etc/timezone` (Debian/Ubuntu), `/etc/localtime` symlink (most Linux + macOS), `timedatectl` (systemd), `systemsetup` (macOS), `/etc/sysconfig/clock` (older RHEL/SUSE/Gentoo)
+- Falls back to `UTC` if none succeed; can always be overridden with `-t`
+
+**Portable `realpath`**
+- Resolution chain: GNU `realpath` → `grealpath` (macOS Homebrew) → `python3` → `python2` → pure-Bash absolute path expansion
+- No longer requires GNU coreutils on macOS
+
+**Hardened semver comparison**
+- Validates that `sort -V` actually works numerically before trusting it (macOS system sort silently misbehaves)
+- Chain: verified `sort -V` → `gsort -V` (Homebrew coreutils) → Python 3 → Python 2 → pure-Bash integer comparison
+
+**Hardened JSON parsing**
+- Fetching Docker Hub version lists now uses: `jq` → `python3` (stdin pipe) → `python2` (stdin pipe) → `grep` fallback
+- All Python paths use `stdin` piping instead of shell-embedded JSON strings, avoiding injection risks
+
+**Bash 3.2 compatibility**
+- All `mapfile`/`readarray` calls replaced with `while read` loops
+- Works on macOS default bash (`/bin/bash` is 3.2) without requiring Homebrew bash
+
+**Explicit HTTP client requirement for `update`/`upgrade`**
+- `require_http_client` guard: if neither `curl` nor `wget` is present, prints the correct install command and exits cleanly instead of silently failing
+
+**`status` command improvements**
+- Now shows detected platform (OS name + CPU architecture) and auto-detected timezone
+
+---
+
 ## Features
 
 | Capability | Detail |
 |---|---|
 | **One-command deploy** | `./deploy-n8n.sh start` handles everything end-to-end |
+| **Cross-platform** | 20+ Linux distros + macOS Ventura/Sonoma/Sequoia, Intel & Apple Silicon |
 | **External task runners** | Spins up `n8nio/runners` sidecar automatically, pinned to the same version as n8n |
 | **Interactive version picker** | `update` fetches the 10 latest n8n releases from Docker Hub and lets you choose |
 | **One-click upgrade** | `upgrade` finds the newest release and redeploys — ideal for cron |
 | **Downgrade support** | Select any older release via `update` with explicit confirmation |
 | **Automated backups** | `backup` snapshots the Docker volume to a `.tar.gz` archive; keeps the 10 most recent |
 | **Interactive restore** | `restore` shows a numbered list of your backups to choose from |
+| **Timezone auto-detection** | 5-strategy cascade across all major Linux layouts and macOS |
+| **OS-aware error messages** | Missing dependency errors include the correct install command for your distro |
+| **Portable realpath** | No GNU coreutils requirement; works on stock macOS bash 3.2 |
+| **Robust semver comparison** | 5-level fallback chain; validates `sort -V` correctness before use |
+| **Robust JSON parsing** | `jq` → Python 3 → Python 2 → grep; Python paths use stdin to avoid injection |
 | **Concurrency lock** | PID-file locking prevents overlapping deployments |
 | **Persistent config** | Port, timezone, container name, etc. are saved and reloaded automatically |
 | **Health checks** | Both containers include Docker health checks; `start -d` waits for healthy |
-| **Ollama-ready** | `host.docker.internal` is mapped to the host gateway so n8n can reach a local Ollama instance |
+| **Ollama-ready** | `host.docker.internal` is mapped to the host gateway for local Ollama access |
 | **Basic auth** | Optional HTTP basic authentication with `-b` |
 | **CI/CD friendly** | `-f` skips all confirmation prompts; `upgrade -f -r` is fully non-interactive |
 
 ---
 
+## Platform Compatibility
+
+### Linux distributions
+
+| Family | Distros |
+|---|---|
+| **Debian/Ubuntu** | Debian · Ubuntu · Raspbian · Linux Mint · Pop!_OS · Kali · elementary · MX · Zorin · Parrot · Tails |
+| **Red Hat/Fedora** | Fedora · RHEL · CentOS · Rocky Linux · AlmaLinux · Oracle Linux · Amazon Linux · Mageia |
+| **SUSE** | openSUSE Leap/Tumbleweed · SLES |
+| **Arch** | Arch Linux · Manjaro · EndeavourOS · Artix · Garuda · CachyOS |
+| **Musl/Alpine** | Alpine Linux (requires `bash` installed separately) |
+| **Other** | Void Linux · Gentoo · Slackware · NixOS · Solus · Puppy Linux · and most independents |
+
+### macOS
+
+| Version | Architecture |
+|---|---|
+| Ventura 13+ · Sonoma 14+ · Sequoia 15+ | Intel (x86_64) + Apple Silicon (arm64) |
+
+> **macOS note:** The system `/bin/bash` on macOS is version 3.2. This script is fully compatible with Bash 3.2 — no Homebrew bash required. For accurate semver comparison, `brew install coreutils` is recommended but not required (Python fallbacks are used otherwise).
+
+> **Alpine Linux note:** Alpine ships `ash`, not `bash`. Install bash first: `apk add bash docker docker-cli-compose openssl`, then run with `bash deploy-n8n.sh`.
+
+> **NixOS note:** Ensure `services.docker.enable = true` in `configuration.nix` and that your user is in the `docker` group.
+
+---
+
 ## Requirements
+
+### Hard requirements (must be present)
 
 | Dependency | Notes |
 |---|---|
+| **Bash** ≥ 3.2 | Pre-installed on Linux and macOS; Alpine needs `apk add bash` |
 | **Docker Engine** ≥ 20.10 | [Install guide](https://docs.docker.com/engine/install/) |
-| **Docker Compose plugin** v2 | Bundled with Docker Desktop; `docker compose version` to verify |
-| **Bash** ≥ 4.0 | Pre-installed on most Linux distros; macOS users may need `brew install bash` |
-| **openssl** | Used to generate the runner auth token; almost always pre-installed |
-| **curl** or **wget** | Required for `update` / `upgrade` version fetching |
-| **python3** *(optional)* | Used for robust JSON parsing and semver comparison; falls back to grep/sort |
+| **Docker Compose plugin** v2 | Bundled with Docker Desktop; verify with `docker compose version` |
+| **openssl** | For runner auth token generation; almost always pre-installed |
 
-> **macOS note:** The default `/bin/bash` on macOS is version 3. Install a modern Bash with `brew install bash` and run the script explicitly with `/usr/local/bin/bash deploy-n8n.sh`.
+### Soft requirements (only for `update` / `upgrade`)
+
+| Dependency | Purpose | Fallback |
+|---|---|---|
+| `curl` or `wget` | Docker Hub API calls | No fallback — at least one required |
+| `jq` | Fast JSON parsing | Python 3 → Python 2 → grep |
+| `python3` or `python` | JSON parsing, semver comparison | grep / pure-bash |
+| `gsort` (macOS) | Correct `sort -V` behaviour | Python → pure-bash |
 
 ---
 
@@ -92,7 +170,7 @@ Open **http://localhost:5678** in your browser to access the n8n UI.
 | `start` | Deploy and start n8n *(default when no command given)* |
 | `stop` | Stop and remove all running containers |
 | `restart` | Restart containers without recreating them |
-| `status` | Show container health, version, volume size, and backup count |
+| `status` | Show container health, version, platform, timezone, volume size, and backup count |
 | `logs [service] [lines]` | Live-tail container logs (`n8n` or `n8n-runners`; default: both) |
 | `update` | Interactive picker — choose from the 10 latest n8n releases |
 | `upgrade` | One-click upgrade to the latest stable release |
@@ -116,7 +194,7 @@ Open **http://localhost:5678** in your browser to access the n8n UI.
 | `-b` | Enable HTTP basic authentication (prompts for credentials) | off |
 | `-n NAME` | Container name | `n8n` |
 | `-p PORT` | Host port to expose | `5678` |
-| `-t TIMEZONE` | Container timezone (e.g. `America/New_York`) | system timezone |
+| `-t TIMEZONE` | Container timezone (e.g. `America/New_York`) | auto-detected |
 | `-e FILE` | Path to an extra `.env` file injected into the container | — |
 | `-w URL` | Webhook base URL (e.g. `https://n8n.example.com`) | — |
 | `-l LEVEL` | Log level: `error` \| `warn` \| `info` \| `debug` | `info` |
@@ -205,7 +283,7 @@ Fetches only the **single latest release**, compares it to what you have, and up
 # Tail only the main n8n container (last 200 lines)
 ./deploy-n8n.sh logs n8n 200
 
-# Show status (version, health, volume size, backup count)
+# Show status (version, platform, timezone, volume size, backup count)
 ./deploy-n8n.sh status
 
 # Create a backup
@@ -254,6 +332,7 @@ Fetches only the **single latest release**, compares it to what you have, and up
 - **Task broker isolation:** Port `5679` (the task broker) is bound to `127.0.0.1` on the host. The runners container reaches it via the internal Docker network (`http://n8n:5679`), never through the host interface.
 - **Shared volume:** Both containers mount `n8n_data` so the runners can access the same credentials and workflow data as the main process.
 - **Health checks:** Both services define Docker health checks. The `start -d` command waits up to 120 seconds for n8n to become healthy before returning.
+- **Bash 3.2 compatibility:** No `mapfile`/`readarray`; all array builds use `while IFS= read -r` loops. Works on stock macOS bash without Homebrew.
 
 ---
 
@@ -357,16 +436,13 @@ You can also pass additional n8n environment variables via an `.env` file using 
 
 Since n8n 1.x, Python and JavaScript code nodes run in an **external task runner** process for security isolation. The runners image must match the n8n version exactly. This script detects and pins both to the same version automatically.
 
+**Q: My distro isn't in the list — will it still work?**
+
+Almost certainly yes, if Docker and bash ≥ 3.2 are available. The platform detection affects only the install hint messages in error output. The core logic is pure POSIX bash and works on any Linux or macOS system.
+
 **Q: Can I run multiple n8n instances on the same machine?**
 
-Yes. Use `-n` and `-p` to give each instance a unique container name and port:
-
-```bash
-./deploy-n8n.sh start -n n8n-prod -p 5678 -d -r
-./deploy-n8n.sh start -n n8n-dev  -p 5679 -d
-```
-
-You'll also want to set `N8N_DEPLOY_DIR` to a different path for each instance so their configs don't collide:
+Yes. Use `-n` and `-p` to give each instance a unique container name and port, and set `N8N_DEPLOY_DIR` to a different path for each:
 
 ```bash
 N8N_DEPLOY_DIR=~/.n8n-prod ./deploy-n8n.sh start -n n8n-prod -p 5678 -d -r
@@ -388,9 +464,23 @@ N8N_SMTP_HOST=smtp.example.com
 ./deploy-n8n.sh start -d -r -e ~/n8n.env
 ```
 
+**Q: The timezone is showing as UTC even though I'm in a different zone.**
+
+Run with an explicit `-t` flag to override:
+
+```bash
+./deploy-n8n.sh start -t America/New_York -d -r
+```
+
+The auto-detected timezone is saved to `.config` after the first run — so you only need to pass `-t` once.
+
 **Q: The `-s` flag doesn't seem to skip the version check.**
 
 `-s` requires a previously cached version. On the very first run, or after `uninstall`, there is no cache — the script falls through to detection automatically. On subsequent runs, `-s` will use the cached value and start instantly.
+
+**Q: `update`/`upgrade` fails with "Neither curl nor wget is available".**
+
+Install at least one HTTP client. The error message now prints the correct command for your distro — look for the `→ Install curl` hint in the output.
 
 **Q: I get "docker compose: command not found".**
 
@@ -405,12 +495,13 @@ sudo apt-get install docker-compose-plugin
 
 **Q: Can I use this on macOS?**
 
-Yes, with Docker Desktop for Mac. Note that macOS ships with Bash 3 — you may need to install Bash 4+ via Homebrew and invoke the script explicitly:
+Yes, with Docker Desktop for Mac. The script is compatible with the default macOS bash 3.2 — no Homebrew bash required. For accurate semver comparison (used by `update`/`upgrade`), install coreutils:
 
 ```bash
-brew install bash
-/opt/homebrew/bin/bash deploy-n8n.sh start -d
+brew install coreutils
 ```
+
+This is optional; Python and pure-bash fallbacks are used if `gsort` is not available.
 
 ---
 
@@ -419,9 +510,10 @@ brew install bash
 Issues and pull requests are welcome. Please open an issue first to discuss significant changes.
 
 When submitting a PR:
-- Test against both Linux and macOS
+- Test against at least Linux (Debian/Ubuntu) and macOS
 - Run `shellcheck deploy-n8n.sh` and address any warnings
 - Keep the script self-contained (no extra files required to run)
+- Verify bash 3.2 compatibility (no `mapfile`, no `declare -A`, etc.)
 
 ---
 

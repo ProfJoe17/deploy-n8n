@@ -1,21 +1,36 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # =============================================================================
-#  deploy-n8n.sh — n8n deployment manager
+#  deploy-n8n.sh — n8n deployment manager  v1.1.0
 #  Manages n8n + external Python/JS task runners via Docker Compose
+#
+#  Tested on:
+#    Linux  — Debian · Ubuntu · Red Hat · Fedora · CentOS · Rocky · AlmaLinux
+#             openSUSE · SLES · Arch · Manjaro · Alpine · Void · Gentoo
+#             Slackware · NixOS · Solus · Puppy · and most independents
+#    macOS  — Ventura 13+ · Sonoma 14+ · Sequoia 15+  (Intel & Apple Silicon)
+#
+#  Hard requirements:
+#    bash ≥ 3.2   docker (with Compose v2 plugin)   openssl
+#
+#  Soft requirements (needed only for 'update' / 'upgrade' commands):
+#    curl  OR  wget        — HTTP calls to Docker Hub API
+#    jq  OR  python3/2     — JSON parsing  (grep fallback also available)
+#
+#  On Alpine Linux (which ships ash/sh, not bash):
+#    apk add bash docker docker-cli-compose openssl
 # =============================================================================
 set -euo pipefail
 IFS=$'\n\t'
 
 # ─── Script metadata ──────────────────────────────────────────────────────────
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="3.1.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 
-# ─── Defaults ─────────────────────────────────────────────────────────────────
+# ─── Defaults (TIMEZONE resolved after platform-detection functions load) ─────
 DEPLOY_DIR="${N8N_DEPLOY_DIR:-$HOME/.n8n-deploy}"
 CONTAINER_NAME="n8n"
 VOLUME_NAME="n8n_data"
 HOST_PORT=5678
-TIMEZONE="$(cat /etc/timezone 2>/dev/null || echo 'UTC')"
 AUTO_UPDATE=false
 SKIP_UPDATE=false
 DETACHED=false
@@ -26,7 +41,6 @@ BASIC_AUTH_USER=""
 BASIC_AUTH_PASS=""
 ENV_FILE=""
 WEBHOOK_URL=""
-BACKUP_DIR="${DEPLOY_DIR}/backups"
 LOG_LEVEL="info"
 
 # ─── Derived paths ────────────────────────────────────────────────────────────
@@ -35,10 +49,230 @@ token_file()    { echo "${DEPLOY_DIR}/.runner_token"; }
 config_file()   { echo "${DEPLOY_DIR}/.config"; }
 lock_file()     { echo "${DEPLOY_DIR}/.lock"; }
 
-# ─── Colours ──────────────────────────────────────────────────────────────────
+# =============================================================================
+#  PLATFORM DETECTION
+#  All functions here are intentionally dependency-free (pure bash + POSIX
+#  tools only) so they can run before prerequisites are checked.
+# =============================================================================
+
+# ─── OS identifier ────────────────────────────────────────────────────────────
+# Returns a lowercase ID string matching /etc/os-release ID where possible,
+# plus "macos" for Darwin hosts.
+detect_os() {
+  # macOS — OSTYPE is set to "darwin*" by bash itself; uname as belt-and-braces
+  case "${OSTYPE:-}" in darwin*) echo "macos"; return ;; esac
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] && { echo "macos"; return; }
+
+  # Modern Linux — /etc/os-release (systemd era, also present on musl/Alpine)
+  if [ -f /etc/os-release ]; then
+    local id
+    id=$(. /etc/os-release 2>/dev/null && printf '%s' "${ID:-}" | tr '[:upper:]' '[:lower:]')
+    [ -n "$id" ] && { echo "$id"; return; }
+  fi
+
+  # Legacy release files (pre-/etc/os-release era)
+  [ -f /etc/alpine-release   ] && { echo "alpine";    return; }
+  [ -f /etc/arch-release     ] && { echo "arch";      return; }
+  [ -f /etc/gentoo-release   ] && { echo "gentoo";    return; }
+  [ -f /etc/slackware-version] && { echo "slackware"; return; }
+  [ -f /etc/debian_version   ] && { echo "debian";    return; }
+  [ -f /etc/redhat-release   ] && { echo "rhel";      return; }
+
+  echo "linux"  # generic fallback
+}
+
+# Returns the broader package-manager family for the current OS.
+detect_os_family() {
+  local os; os=$(detect_os)
+  case "$os" in
+    ubuntu|debian|raspbian|linuxmint|pop|kali|elementary|mx|zorin|parrot|tails)
+      echo "debian" ;;
+    fedora|rhel|centos|rocky|almalinux|ol|scientific|amzn|mageia|clearos)
+      echo "redhat" ;;
+    opensuse*|suse|sles)
+      echo "suse" ;;
+    arch|manjaro|endeavouros|artix|garuda|blackarch|cachyos)
+      echo "arch" ;;
+    alpine)
+      echo "alpine" ;;
+    void)
+      echo "void" ;;
+    gentoo)
+      echo "gentoo" ;;
+    slackware)
+      echo "slackware" ;;
+    nixos)
+      echo "nixos" ;;
+    solus)
+      echo "solus" ;;
+    macos)
+      echo "macos" ;;
+    *)
+      echo "linux" ;;
+  esac
+}
+
+# ─── OS-aware package install hint ────────────────────────────────────────────
+# Usage: pkg_install_hint <generic_name>
+# Generic names understood: docker  openssl  curl  wget  jq  python3
+pkg_install_hint() {
+  local pkg="$1"
+  local family; family=$(detect_os_family)
+
+  case "$family" in
+    debian)
+      case "$pkg" in
+        docker)  echo "sudo apt-get install -y docker.io docker-compose-plugin" ;;
+        python3) echo "sudo apt-get install -y python3" ;;
+        *)       echo "sudo apt-get install -y ${pkg}" ;;
+      esac ;;
+    redhat)
+      local mgr="dnf"; command -v dnf &>/dev/null || mgr="yum"
+      case "$pkg" in
+        docker)  echo "sudo ${mgr} install -y docker-ce docker-compose-plugin" ;;
+        python3) echo "sudo ${mgr} install -y python3" ;;
+        *)       echo "sudo ${mgr} install -y ${pkg}" ;;
+      esac ;;
+    suse)
+      case "$pkg" in
+        docker)  echo "sudo zypper install -y docker docker-compose" ;;
+        *)       echo "sudo zypper install -y ${pkg}" ;;
+      esac ;;
+    arch)
+      case "$pkg" in
+        docker)  echo "sudo pacman -S --noconfirm docker docker-compose" ;;
+        python3) echo "sudo pacman -S --noconfirm python" ;;
+        *)       echo "sudo pacman -S --noconfirm ${pkg}" ;;
+      esac ;;
+    alpine)
+      case "$pkg" in
+        docker)  echo "sudo apk add docker docker-cli-compose" ;;
+        python3) echo "sudo apk add python3" ;;
+        *)       echo "sudo apk add ${pkg}" ;;
+      esac ;;
+    void)
+      case "$pkg" in
+        docker)  echo "sudo xbps-install -y docker docker-compose" ;;
+        python3) echo "sudo xbps-install -y python3" ;;
+        *)       echo "sudo xbps-install -y ${pkg}" ;;
+      esac ;;
+    gentoo)
+      case "$pkg" in
+        docker)  echo "sudo emerge app-containers/docker" ;;
+        openssl) echo "sudo emerge dev-libs/openssl" ;;
+        curl)    echo "sudo emerge net-misc/curl" ;;
+        wget)    echo "sudo emerge net-misc/wget" ;;
+        jq)      echo "sudo emerge app-misc/jq" ;;
+        python3) echo "sudo emerge dev-lang/python" ;;
+        *)       echo "sudo emerge ${pkg}" ;;
+      esac ;;
+    slackware)
+      echo "slackpkg install ${pkg}" ;;
+    nixos)
+      case "$pkg" in
+        docker)  echo "# add services.docker.enable = true; to configuration.nix" ;;
+        *)       echo "nix-env -iA nixpkgs.${pkg}  # or add to configuration.nix" ;;
+      esac ;;
+    solus)
+      case "$pkg" in
+        docker)  echo "sudo eopkg install docker" ;;
+        *)       echo "sudo eopkg install ${pkg}" ;;
+      esac ;;
+    macos)
+      case "$pkg" in
+        docker)  echo "Download Docker Desktop: https://www.docker.com/products/docker-desktop/" ;;
+        *)       echo "brew install ${pkg}" ;;
+      esac ;;
+    *)
+      echo "(install ${pkg} via your distro's package manager)" ;;
+  esac
+}
+
+# ─── Timezone detection ───────────────────────────────────────────────────────
+# Tries five strategies in order, emits the first non-empty result or "UTC".
+detect_timezone() {
+  local tz=""
+
+  # 1. /etc/timezone — Debian / Ubuntu family
+  if [ -z "$tz" ] && [ -f /etc/timezone ]; then
+    tz=$(tr -d '[:space:]' < /etc/timezone 2>/dev/null)
+  fi
+
+  # 2. /etc/localtime symlink — most Linux distros + macOS
+  #    Linux path:  .../zoneinfo/Region/City
+  #    macOS path:  /var/db/timezone/zoneinfo/Region/City
+  if [ -z "$tz" ] && [ -L /etc/localtime ]; then
+    local lnk
+    lnk=$(readlink /etc/localtime 2>/dev/null)
+    tz=$(printf '%s' "$lnk" | sed 's|.*/zoneinfo/||; s|^posix/||')
+  fi
+
+  # 3. timedatectl — systemd-based distros (Fedora, Arch, Debian ≥9, etc.)
+  if [ -z "$tz" ] && command -v timedatectl &>/dev/null; then
+    tz=$(timedatectl show --property=Timezone --value 2>/dev/null) \
+    || tz=$(timedatectl status 2>/dev/null \
+          | grep -E '^\s*(Time zone|Timezone):' \
+          | head -1 | sed 's/.*: *//' | awk '{print $1}') \
+    || true
+  fi
+
+  # 4. systemsetup — macOS (may need sudo on some versions; ignore failures)
+  if [ -z "$tz" ] && command -v systemsetup &>/dev/null; then
+    tz=$(systemsetup -gettimezone 2>/dev/null \
+        | sed 's/.*Time Zone: *//' | tr -d '[:space:]') || true
+  fi
+
+  # 5. /etc/sysconfig/clock — older Red Hat / SUSE / Gentoo
+  if [ -z "$tz" ] && [ -f /etc/sysconfig/clock ]; then
+    tz=$(grep -E '^(TIMEZONE|ZONE)=' /etc/sysconfig/clock 2>/dev/null \
+        | head -1 | sed 's/^[^=]*=//; s/^"//; s/"$//')
+  fi
+
+  printf '%s' "${tz:-UTC}"
+}
+
+# ─── Portable realpath ────────────────────────────────────────────────────────
+# Resolves to an absolute path.  Tries: GNU realpath → grealpath (macOS brew)
+# → python3 → python2 → pure-bash (makes absolute; no symlink resolution).
+portable_realpath() {
+  local p="$1"
+  command -v realpath  &>/dev/null && { realpath  "$p" 2>/dev/null && return 0; } || true
+  command -v grealpath &>/dev/null && { grealpath "$p" 2>/dev/null && return 0; } || true
+  command -v python3   &>/dev/null && {
+    python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$p" 2>/dev/null && return 0
+  } || true
+  command -v python    &>/dev/null && {
+    python  -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$p" 2>/dev/null && return 0
+  } || true
+  # Pure-bash fallback — makes relative paths absolute; no symlink resolution
+  [[ "$p" == /* ]] || p="$PWD/$p"
+  printf '%s' "$p"
+}
+
+# ─── HTTP client abstraction ──────────────────────────────────────────────────
+has_http_client() { command -v curl &>/dev/null || command -v wget &>/dev/null; }
+
+http_get() {
+  local url="$1"
+  if command -v curl &>/dev/null; then
+    curl -sf --connect-timeout 10 --max-time 20 "$url" 2>/dev/null
+  elif command -v wget &>/dev/null; then
+    wget -qO- --timeout=20 "$url" 2>/dev/null
+  else
+    return 1
+  fi
+}
+
+# ─── Resolve TIMEZONE now that detect_timezone is defined ─────────────────────
+TIMEZONE=$(detect_timezone)
+BACKUP_DIR="${DEPLOY_DIR}/backups"
+
+# =============================================================================
+#  COLOURS
+# =============================================================================
 if [ -t 1 ]; then
-  RED=$'\033[0;31m';   GREEN=$'\033[0;32m';  YELLOW=$'\033[1;33m'
-  CYAN=$'\033[0;36m';  BOLD=$'\033[1m';      DIM=$'\033[2m';  NC=$'\033[0m'
+  RED=$'\033[0;31m';     GREEN=$'\033[0;32m';   YELLOW=$'\033[1;33m'
+  CYAN=$'\033[0;36m';    BOLD=$'\033[1m';        DIM=$'\033[2m';      NC=$'\033[0m'
   MAGENTA=$'\033[0;35m'; BLUE=$'\033[0;34m'
 else
   RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; DIM=''; NC=''
@@ -53,7 +287,9 @@ die()     { error "$*"; exit 1; }
 step()    { echo -e "\n${BOLD}▶  $*${NC}"; }
 dim()     { echo -e "${DIM}$*${NC}"; }
 
-# ─── Trap & cleanup ───────────────────────────────────────────────────────────
+# =============================================================================
+#  TRAP & CLEANUP
+# =============================================================================
 _TMPDIR=""
 cleanup() {
   local code=$?
@@ -65,7 +301,9 @@ cleanup() {
 trap cleanup EXIT
 trap 'echo ""; die "Interrupted."' INT TERM
 
-# ─── Locking (prevent concurrent runs) ───────────────────────────────────────
+# =============================================================================
+#  LOCKING
+# =============================================================================
 acquire_lock() {
   local lock; lock="$(lock_file)"
   mkdir -p "$DEPLOY_DIR"
@@ -80,28 +318,53 @@ acquire_lock() {
   echo $$ > "$lock"
 }
 
-# ─── Prerequisite checks ──────────────────────────────────────────────────────
+# =============================================================================
+#  PREREQUISITE CHECKS
+# =============================================================================
 check_prerequisites() {
   local missing=()
   command -v docker  &>/dev/null || missing+=("docker")
   command -v openssl &>/dev/null || missing+=("openssl")
 
-  if ! docker compose version &>/dev/null; then
-    missing+=("docker-compose-plugin (v2)")
+  if ! docker compose version &>/dev/null 2>&1; then
+    missing+=("docker-compose-plugin")
   fi
 
   if [ ${#missing[@]} -ne 0 ]; then
     error "Missing required tools: ${missing[*]}"
-    echo  "  Install guide: https://docs.docker.com/engine/install/"
+    local m
+    for m in "${missing[@]}"; do
+      echo "  → Install ${m}: $(pkg_install_hint "$m")"
+    done
+    echo "  Docker guide: https://docs.docker.com/engine/install/"
     exit 1
   fi
 
   if ! docker info &>/dev/null; then
-    die "Docker daemon is not running. Start it with: sudo systemctl start docker"
+    local os; os=$(detect_os)
+    local start_cmd
+    case "$os" in
+      macos)     start_cmd="open -a Docker" ;;
+      alpine|gentoo|void|slackware) start_cmd="sudo rc-service docker start  # or: sudo service docker start" ;;
+      nixos)     start_cmd="sudo systemctl start docker  # ensure services.docker.enable = true in configuration.nix" ;;
+      *)         start_cmd="sudo systemctl start docker" ;;
+    esac
+    die "Docker daemon is not running. Start it with: ${start_cmd}"
   fi
 }
 
-# ─── Persist / load config ────────────────────────────────────────────────────
+# Soft check used only by update/upgrade commands.
+require_http_client() {
+  has_http_client && return 0
+  error "Neither curl nor wget is available. The '${1:-update}' command requires one."
+  echo "  → Install curl : $(pkg_install_hint curl)"
+  echo "  → Install wget : $(pkg_install_hint wget)"
+  exit 1
+}
+
+# =============================================================================
+#  PERSIST / LOAD CONFIG
+# =============================================================================
 save_config() {
   mkdir -p "$DEPLOY_DIR"
   cat > "$(config_file)" <<EOF
@@ -122,19 +385,16 @@ load_config() {
   [ -f "$cfg" ] && source "$cfg" || true
 }
 
-# ─── Version detection ────────────────────────────────────────────────────────
-# Strategy (fastest → slowest):
-#   1. -s flag: return cached version immediately, no network at all
-#   2. docker inspect label: reads OCI label from local image (instant, no container)
-#   3. docker run fallback: spawns a container to read package.json (slow, last resort)
-# Result is always cached to .config for future runs.
+# =============================================================================
+#  VERSION DETECTION  (local image)
+#  Strategy: -s flag (cached) → docker inspect label → docker run fallback
+# =============================================================================
 N8N_CACHED_VERSION=""   # populated by load_config
 
 detect_n8n_version() {
-  # ── 1. Skip mode: trust the cache ──────────────────────────────────────────
   if [ "$SKIP_UPDATE" = true ]; then
     if [ -n "$N8N_CACHED_VERSION" ]; then
-      info "Skipping update check — using cached version ${GREEN}${N8N_CACHED_VERSION}${NC}  (remove -s to check for updates)"
+      info "Skipping update check — using cached version ${GREEN}${N8N_CACHED_VERSION}${NC}  (-s)"
       echo "$N8N_CACHED_VERSION"
       return
     else
@@ -142,14 +402,12 @@ detect_n8n_version() {
     fi
   fi
 
-  # ── 2. Fast path: read OCI label from already-pulled image ─────────────────
   local ver
   ver=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' \
     docker.n8n.io/n8nio/n8n:latest 2>/dev/null || true)
 
-  # ── 3. Slow fallback: spin up a container and read package.json ─────────────
   if [ -z "$ver" ]; then
-    info "Image label not available — running version probe (one-time, ~5s)..."
+    info "Image label unavailable — running version probe (one-time, ~5 s)..."
     docker pull docker.n8n.io/n8nio/n8n:latest &>/dev/null || true
     ver=$(docker run --rm --entrypoint="" \
       docker.n8n.io/n8nio/n8n:latest \
@@ -158,65 +416,85 @@ detect_n8n_version() {
   fi
 
   [ -z "$ver" ] && die "Could not determine n8n version. Check Docker / network connectivity."
-
-  # Cache for next run
   N8N_CACHED_VERSION="$ver"
   echo "$ver"
 }
 
-# ─── HTTP helper (curl or wget) ───────────────────────────────────────────────
-# Usage: http_get <url>
-# Returns the response body on stdout; returns 1 on failure.
-http_get() {
-  local url="$1"
-  if command -v curl &>/dev/null; then
-    curl -sf --connect-timeout 10 --max-time 20 "$url" 2>/dev/null
-  elif command -v wget &>/dev/null; then
-    wget -qO- --timeout=20 "$url" 2>/dev/null
-  else
-    return 1
-  fi
-}
-
-# ─── Semver comparison ────────────────────────────────────────────────────────
-# version_gt A B  →  returns 0 (true) if A > B, 1 otherwise.
-# Uses sort -V (GNU coreutils); falls back to python3 if unavailable.
+# =============================================================================
+#  SEMVER COMPARISON
+#  version_gt A B  →  exit 0 (true) if A is strictly greater than B
+#  Chain: GNU sort -V → gsort -V (macOS Homebrew) → python3 → python2 →
+#         pure-bash integer comparison
+# =============================================================================
 version_gt() {
   local a="$1" b="$2"
-  if [ "$a" = "$b" ]; then return 1; fi
+  [ "$a" = "$b" ] && return 1
 
-  if sort --version-sort /dev/null &>/dev/null; then
-    # GNU sort available
-    local highest
-    highest=$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n1)
-    [ "$highest" = "$a" ]
-  elif command -v python3 &>/dev/null; then
-    python3 - "$a" "$b" <<'EOF'
-import sys
-def semver(v):
-    try: return tuple(int(x) for x in v.split('.'))
-    except: return (0, 0, 0)
-sys.exit(0 if semver(sys.argv[1]) > semver(sys.argv[2]) else 1)
-EOF
-  else
-    # Last resort: lexicographic (imperfect but usually fine for n8n's linear versioning)
-    [ "$(printf '%s\n%s\n' "$a" "$b" | sort | tail -n1)" = "$a" ]
+  # Verify sort -V gives correct numeric ordering before trusting it
+  # (macOS system sort may silently accept -V but sort lexicographically)
+  local _sort_v_ok=false
+  if printf '1.10\n1.9\n' | sort -V 2>/dev/null | head -1 | grep -q '^1\.9$'; then
+    _sort_v_ok=true
   fi
+
+  if [ "$_sort_v_ok" = true ]; then
+    [ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n1)" = "$a" ]
+    return
+  fi
+
+  # gsort -V — macOS with Homebrew coreutils
+  if command -v gsort &>/dev/null; then
+    [ "$(printf '%s\n%s\n' "$a" "$b" | gsort -V | tail -n1)" = "$a" ]
+    return
+  fi
+
+  # python3
+  if command -v python3 &>/dev/null; then
+    python3 - "$a" "$b" <<'PYEOF'
+import sys
+def v(s):
+    try: return tuple(int(x) for x in s.split('.'))
+    except: return (0, 0, 0)
+sys.exit(0 if v(sys.argv[1]) > v(sys.argv[2]) else 1)
+PYEOF
+    return
+  fi
+
+  # python2
+  if command -v python &>/dev/null; then
+    python - "$a" "$b" <<'PYEOF'
+import sys
+def v(s):
+    try: return tuple(int(x) for x in s.split('.'))
+    except: return (0, 0, 0)
+sys.exit(0 if v(sys.argv[1]) > v(sys.argv[2]) else 1)
+PYEOF
+    return
+  fi
+
+  # Pure-bash integer comparison — splits on '.' with read -ra
+  local -a va vb
+  IFS='.' read -ra va <<< "$a"
+  IFS='.' read -ra vb <<< "$b"
+  local i
+  for i in 0 1 2; do
+    local na="${va[$i]:-0}" nb="${vb[$i]:-0}"
+    (( na > nb )) && return 0
+    (( na < nb )) && return 1
+  done
+  return 1  # equal
 }
 
-# ─── Fetch version list from Docker Hub ───────────────────────────────────────
-# Queries the Docker Hub tags API, filters for semver tags (x.y.z), and
-# returns up to N versions (default 10), most-recent first.
+# =============================================================================
+#  DOCKER HUB VERSION LIST
+#  fetch_n8n_versions [count=10]
+#  Fetches tags from Docker Hub, strips non-semver tags (latest, nightly, etc.),
+#  and emits up to <count> version strings, most-recent first.
 #
-# Usage: fetch_n8n_versions [count]
-# Output: newline-delimited list of version strings, e.g.
-#   1.98.2
-#   1.97.1
-#   ...
+#  JSON parsing chain: jq → python3 (pipe) → python2 (pipe) → grep fallback
+# =============================================================================
 fetch_n8n_versions() {
   local count="${1:-10}"
-  # We request a larger page to have enough semver candidates after filtering
-  # out rolling tags (latest, nightly, next, ai, etc.)
   local api_url="https://hub.docker.com/v2/repositories/n8nio/n8n/tags?page_size=100&ordering=last_updated"
 
   local raw
@@ -224,47 +502,72 @@ fetch_n8n_versions() {
     warn "Could not reach Docker Hub API. Check network connectivity."
     return 1
   }
+  [ -z "$raw" ] && { warn "Docker Hub returned an empty response."; return 1; }
 
-  # Parse with python3 (preferred — reliable JSON parsing)
-  if command -v python3 &>/dev/null; then
-    python3 - "$count" <<EOF
-import json, sys, re
-count = int(sys.argv[1])
-try:
-    data = json.loads("""${raw}""")
-except Exception:
-    # Fallback: try stdin approach
-    import os
-    data = json.loads(os.environ.get('_RAW','{}'))
-
-semver_re = re.compile(r'^\d+\.\d+\.\d+$')
-tags = [t['name'] for t in data.get('results', []) if semver_re.fullmatch(t['name'])]
-print('\n'.join(tags[:count]))
-EOF
-  else
-    # Pure-bash fallback using grep
-    echo "$raw" \
-      | grep -oE '"name"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+"' \
-      | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+  # jq — most reliable and fastest; widely available on all platforms
+  if command -v jq &>/dev/null; then
+    printf '%s' "$raw" \
+      | jq -r '.results[].name' 2>/dev/null \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
       | head -n "$count"
+    return
   fi
+
+  # python3 — pipe raw JSON to stdin (avoids shell-expansion injection)
+  if command -v python3 &>/dev/null; then
+    printf '%s' "$raw" | python3 -c "
+import json, sys, re
+r = re.compile(r'^[0-9]+\.[0-9]+\.[0-9]+$')
+data = json.load(sys.stdin)
+count = 0
+for t in data.get('results', []):
+    if r.match(t.get('name', '')):
+        print(t['name'])
+        count += 1
+        if count >= int(${count}): break
+" 2>/dev/null
+    return
+  fi
+
+  # python2 — same approach
+  if command -v python &>/dev/null; then
+    printf '%s' "$raw" | python -c "
+import json, sys, re
+r = re.compile(r'^[0-9]+[.][0-9]+[.][0-9]+$')
+data = json.load(sys.stdin)
+count = 0
+for t in data.get('results', []):
+    if r.match(t.get('name', '')):
+        sys.stdout.write(t['name'] + '\n')
+        count += 1
+        if count >= int(${count}): break
+" 2>/dev/null
+    return
+  fi
+
+  # grep-only fallback — works everywhere; less precise but covers 99 % of cases
+  printf '%s' "$raw" \
+    | grep -oE '"name"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+"' \
+    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+    | head -n "$count"
 }
 
-# ─── Get the currently deployed n8n version ───────────────────────────────────
-# Checks (in order): running container label → cached config value → "unknown"
+# =============================================================================
+#  GET CURRENTLY DEPLOYED VERSION
+#  Checks (in order): running container OCI label → cached config → compose file
+# =============================================================================
 get_current_deployed_version() {
-  # 1. Running container label
-  local ver
+  local ver=""
+
+  # 1. Running container OCI label
   ver=$(docker inspect --format \
     '{{index .Config.Labels "org.opencontainers.image.version"}}' \
     "${CONTAINER_NAME}" 2>/dev/null | tr -d '[:space:]') || true
 
   # 2. Cached config value
-  if [ -z "$ver" ] && [ -n "${N8N_CACHED_VERSION:-}" ]; then
-    ver="$N8N_CACHED_VERSION"
-  fi
+  [ -z "$ver" ] && [ -n "${N8N_CACHED_VERSION:-}" ] && ver="$N8N_CACHED_VERSION"
 
-  # 3. Parse from running image tag in compose file
+  # 3. Compose file image tag
   if [ -z "$ver" ] && [ -f "$(compose_file)" ]; then
     ver=$(grep -m1 'image:.*n8nio/n8n' "$(compose_file)" 2>/dev/null \
       | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1) || true
@@ -273,13 +576,12 @@ get_current_deployed_version() {
   echo "${ver:-unknown}"
 }
 
-# ─── Interactive version picker ───────────────────────────────────────────────
-# Displays a numbered list of up to 10 recent versions.
-# Highlights the currently installed version.
-# Returns the selected version string in the global SELECTED_VERSION variable.
-#
-# Usage:  pick_n8n_version [count]
-# Sets:   SELECTED_VERSION
+# =============================================================================
+#  INTERACTIVE VERSION PICKER
+#  Displays the 10 most-recent stable n8n releases from Docker Hub.
+#  Installed version is highlighted; newer versions are marked with ↑.
+#  Result is stored in SELECTED_VERSION.
+# =============================================================================
 SELECTED_VERSION=""
 
 pick_n8n_version() {
@@ -290,7 +592,7 @@ pick_n8n_version() {
   local versions_raw
   versions_raw=$(fetch_n8n_versions "$count") || die "Unable to retrieve version list."
 
-  # Load into array
+  # Load into array — bash 3.2-compatible (no mapfile)
   local versions=()
   while IFS= read -r v; do
     [ -n "$v" ] && versions+=("$v")
@@ -307,10 +609,9 @@ pick_n8n_version() {
     local marker="   "
     local label=""
     local colour="${NC}"
+    local upgrade_marker=""
 
-    if [ "$v" = "${versions[0]}" ]; then
-      label="${DIM} ← latest${NC}"
-    fi
+    [ "$v" = "${versions[0]}" ] && label="${DIM} ← latest${NC}"
 
     if [ "$v" = "$current" ]; then
       marker="${GREEN}▶  ${NC}"
@@ -318,15 +619,13 @@ pick_n8n_version() {
       colour="${GREEN}"
     fi
 
-    # Is this version newer than current?
-    local upgrade_marker=""
-    if [ "$current" != "unknown" ] && version_gt "$v" "$current" && [ "$v" != "$current" ]; then
+    if [ "$current" != "unknown" ] && version_gt "$v" "$current"; then
       upgrade_marker=" ${CYAN}↑${NC}"
     fi
 
-    printf "  %s%2d)  ${colour}%-12s${NC}%b%b\n" \
+    printf "  %b%2d)  ${colour}%-12s${NC}%b%b\n" \
       "$marker" "$i" "$v" "$upgrade_marker" "$label"
-    i=$((i+1))
+    i=$(( i + 1 ))
   done
 
   echo ""
@@ -340,13 +639,15 @@ pick_n8n_version() {
     die "Invalid selection: ${sel}"
   fi
 
-  SELECTED_VERSION="${versions[$((sel-1))]}"
+  SELECTED_VERSION="${versions[$(( sel - 1 ))]}"
   echo ""
   info "Selected: ${BOLD}n8n v${SELECTED_VERSION}${NC}"
 }
 
-# ─── Apply a chosen version (shared by update + upgrade) ─────────────────────
-# Usage: apply_n8n_version <version>
+# =============================================================================
+#  APPLY A CHOSEN VERSION  (shared by update & upgrade)
+#  Handles: no-op detection · downgrade warning · backup · pull · redeploy
+# =============================================================================
 apply_n8n_version() {
   local ver="$1"
   local n8n_image="docker.n8n.io/n8nio/n8n:${ver}"
@@ -360,9 +661,9 @@ apply_n8n_version() {
   fi
 
   if version_gt "$current" "$ver" && [ "$current" != "unknown" ]; then
-    warn "You are downgrading from ${YELLOW}${current}${NC} → ${RED}${ver}${NC}."
+    warn "You are downgrading: ${YELLOW}${current}${NC} → ${RED}${ver}${NC}."
     if [ "$FORCE" != true ]; then
-      read -rp "$(echo -e "  Downgrade confirmed? (yes/N): ")" confirm
+      read -rp "  Confirm downgrade? (yes/N): " confirm
       [[ "$confirm" == "yes" ]] || { info "Cancelled."; exit 0; }
     fi
   fi
@@ -386,18 +687,18 @@ apply_n8n_version() {
 
   success "Operation complete → n8n ${GREEN}v${ver}${NC}"
 
-  local direction=""
   if [ "$current" != "unknown" ]; then
     if version_gt "$ver" "$current"; then
-      direction=" (upgraded from v${current})"
+      dim "  (upgraded from v${current})"
     else
-      direction=" (downgraded from v${current})"
+      dim "  (downgraded from v${current})"
     fi
   fi
-  dim "  ${direction}"
 }
 
-# ─── Auth token ───────────────────────────────────────────────────────────────
+# =============================================================================
+#  AUTH TOKEN
+# =============================================================================
 ensure_runner_token() {
   local tok_file; tok_file="$(token_file)"
   if [ -f "$tok_file" ]; then
@@ -412,7 +713,9 @@ ensure_runner_token() {
   fi
 }
 
-# ─── Write docker-compose.yml ─────────────────────────────────────────────────
+# =============================================================================
+#  WRITE DOCKER-COMPOSE.YML
+# =============================================================================
 write_compose() {
   local n8n_image="$1"
   local runners_image="$2"
@@ -422,7 +725,7 @@ write_compose() {
   local env_block=""
   if [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
     env_block="    env_file:
-      - $(realpath "$ENV_FILE")"
+      - $(portable_realpath "$ENV_FILE")"
   fi
 
   local basic_auth_block=""
@@ -472,7 +775,7 @@ ${webhook_block}
     volumes:
       - ${VOLUME_NAME}:/home/node/.n8n
     extra_hosts:
-      - "host.docker.internal:host-gateway"   # reach host Ollama at host.docker.internal:11434
+      - "host.docker.internal:host-gateway"   # reach host Ollama: host.docker.internal:11434
     networks:
       - n8n-net
     depends_on:
@@ -496,7 +799,7 @@ ${env_block}
     volumes:
       - ${VOLUME_NAME}:/home/node/.n8n
     extra_hosts:
-      - "host.docker.internal:host-gateway"   # reach host Ollama at host.docker.internal:11434
+      - "host.docker.internal:host-gateway"
     networks:
       - n8n-net
     healthcheck:
@@ -509,42 +812,48 @@ EOF
   success "docker-compose.yml written → $(compose_file)"
 }
 
-# ─── Pull images ──────────────────────────────────────────────────────────────
+# =============================================================================
+#  PULL IMAGES
+# =============================================================================
 pull_images() {
   local n8n_image="$1" runners_image="$2"
   info "Pulling n8n image     → ${n8n_image}"
-  docker pull "$n8n_image"    || die "Failed to pull n8n image."
+  docker pull "$n8n_image"     || die "Failed to pull n8n image."
   info "Pulling runners image → ${runners_image}"
-  docker pull "$runners_image" || die "Failed to pull runners image. Check: https://hub.docker.com/r/n8nio/runners/tags"
+  docker pull "$runners_image" || die "Failed to pull runners image. See: https://hub.docker.com/r/n8nio/runners/tags"
   success "All images up to date."
 }
 
-# ─── Wait for healthy ─────────────────────────────────────────────────────────
+# =============================================================================
+#  WAIT FOR HEALTHY
+# =============================================================================
 wait_healthy() {
   local name="$1" timeout="${2:-120}"
   info "Waiting for ${name} to become healthy (up to ${timeout}s)..."
   local elapsed=0
-  while [ $elapsed -lt $timeout ]; do
+  while [ "$elapsed" -lt "$timeout" ]; do
     local s
     s=$(docker inspect --format='{{.State.Health.Status}}' "$name" 2>/dev/null || echo "none")
     case "$s" in
       healthy)   echo ""; success "${name} is healthy."; return 0 ;;
-      unhealthy) echo ""; error "${name} is unhealthy."; docker logs --tail 30 "$name"; return 1 ;;
+      unhealthy) echo ""; error   "${name} is unhealthy."; docker logs --tail 30 "$name"; return 1 ;;
     esac
-    sleep 5; elapsed=$((elapsed+5))
-    echo -n "."
+    sleep 5; elapsed=$(( elapsed + 5 ))
+    printf '.'
   done
   echo ""
   warn "Timed out waiting for ${name}. Check logs with: ${SCRIPT_NAME} logs"
   return 1
 }
 
-# ─── COMMAND: backup ──────────────────────────────────────────────────────────
+# =============================================================================
+#  COMMAND: backup
+# =============================================================================
 cmd_backup() {
   step "Backing up n8n data"
   check_prerequisites
 
-  local ts; ts=$(date '+%Y%m%d_%H%M%S')
+  local ts; ts=$(date -u '+%Y%m%d_%H%M%S')
   local archive="${BACKUP_DIR}/n8n_backup_${ts}.tar.gz"
   mkdir -p "$BACKUP_DIR"
 
@@ -561,14 +870,16 @@ cmd_backup() {
   success "Backup complete → ${archive} (${size})"
 
   # Prune — keep 10 most recent
-  local count; count=$(ls -1 "${BACKUP_DIR}"/n8n_backup_*.tar.gz 2>/dev/null | wc -l)
-  if [ "$count" -gt 10 ]; then
+  local count; count=$(ls -1 "${BACKUP_DIR}"/n8n_backup_*.tar.gz 2>/dev/null | wc -l | tr -d '[:space:]')
+  if [ "${count:-0}" -gt 10 ]; then
     info "Pruning old backups (keeping 10 most recent)..."
     ls -1t "${BACKUP_DIR}"/n8n_backup_*.tar.gz | tail -n +11 | xargs rm -f
   fi
 }
 
-# ─── COMMAND: restore ─────────────────────────────────────────────────────────
+# =============================================================================
+#  COMMAND: restore
+# =============================================================================
 cmd_restore() {
   local archive="$1"
   step "Restoring n8n data"
@@ -577,23 +888,30 @@ cmd_restore() {
   if [ -z "$archive" ]; then
     echo ""
     info "Available backups:"
+
+    # bash 3.2-compatible array build (no mapfile)
     local backups=()
-    mapfile -t backups < <(ls -1t "${BACKUP_DIR}"/n8n_backup_*.tar.gz 2>/dev/null || true)
+    while IFS= read -r b; do
+      [ -n "$b" ] && backups+=("$b")
+    done < <(ls -1t "${BACKUP_DIR}"/n8n_backup_*.tar.gz 2>/dev/null || true)
+
     if [ ${#backups[@]} -eq 0 ]; then
       die "No backups found in ${BACKUP_DIR}"
     fi
+
     local i=1
     for b in "${backups[@]}"; do
       local sz; sz=$(du -sh "$b" | cut -f1)
-      printf "  %2d)  %s  [%s]\n" $i "$(basename "$b")" "$sz"
-      i=$((i+1))
+      printf "  %2d)  %s  [%s]\n" "$i" "$(basename "$b")" "$sz"
+      i=$(( i + 1 ))
     done
     echo ""
     read -rp "Enter number to restore (or q to quit): " sel
     [[ "$sel" =~ ^[Qq]$ ]] && exit 0
-    [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le ${#backups[@]} ] \
-      || die "Invalid selection."
-    archive="${backups[$((sel-1))]}"
+    if ! [[ "$sel" =~ ^[0-9]+$ ]] || [ "$sel" -lt 1 ] || [ "$sel" -gt ${#backups[@]} ]; then
+      die "Invalid selection."
+    fi
+    archive="${backups[$(( sel - 1 ))]}"
   fi
 
   [ -f "$archive" ] || die "Archive not found: ${archive}"
@@ -609,17 +927,23 @@ cmd_restore() {
     docker compose -f "$(compose_file)" down 2>/dev/null || true
   fi
 
-  info "Restoring from: ${archive}"
+  local archive_abs; archive_abs=$(portable_realpath "$archive")
+  local archive_dir;  archive_dir=$(dirname "$archive_abs")
+  local archive_name; archive_name=$(basename "$archive_abs")
+
+  info "Restoring from: ${archive_abs}"
   docker run --rm \
     -v "${VOLUME_NAME}:/data" \
-    -v "$(dirname "$(realpath "$archive")"):/backup:ro" \
-    alpine sh -c "rm -rf /data/* /data/.[!.]* 2>/dev/null; tar -xzf '/backup/$(basename "$archive")' -C /data" \
+    -v "${archive_dir}:/backup:ro" \
+    alpine sh -c "rm -rf /data/* /data/.[!.]* 2>/dev/null; tar -xzf '/backup/${archive_name}' -C /data" \
     || die "Restore failed."
 
   success "Restore complete. Run '${SCRIPT_NAME} start' to bring n8n back up."
 }
 
-# ─── COMMAND: logs ────────────────────────────────────────────────────────────
+# =============================================================================
+#  COMMAND: logs
+# =============================================================================
 cmd_logs() {
   local service="${1:-}"
   local lines="${2:-100}"
@@ -633,9 +957,12 @@ cmd_logs() {
   fi
 }
 
-# ─── COMMAND: status ─────────────────────────────────────────────────────────
+# =============================================================================
+#  COMMAND: status
+# =============================================================================
 cmd_status() {
   local cf; cf="$(compose_file)"
+  local os; os=$(detect_os)
   echo ""
   echo -e "${BOLD}════════════════════════════════════════════${NC}"
   echo -e "${BOLD}  n8n Deployment Status${NC}"
@@ -655,17 +982,21 @@ cmd_status() {
 
   local cur_ver; cur_ver=$(get_current_deployed_version)
   info "n8n version  : ${GREEN}${cur_ver}${NC}"
+  info "Platform     : ${os} ($(uname -m 2>/dev/null || echo unknown))"
+  info "Timezone     : ${TIMEZONE}"
 
   local vol_size
   vol_size=$(docker run --rm -v "${VOLUME_NAME}:/data:ro" alpine du -sh /data 2>/dev/null | cut -f1 || echo "unknown")
   info "Volume size  : ${vol_size}"
 
-  local nb; nb=$(ls -1 "${BACKUP_DIR}"/n8n_backup_*.tar.gz 2>/dev/null | wc -l || echo 0)
+  local nb; nb=$(ls -1 "${BACKUP_DIR}"/n8n_backup_*.tar.gz 2>/dev/null | wc -l | tr -d '[:space:]' || echo 0)
   info "Backups      : ${nb} (in ${BACKUP_DIR})"
   echo ""
 }
 
-# ─── COMMAND: stop ────────────────────────────────────────────────────────────
+# =============================================================================
+#  COMMAND: stop
+# =============================================================================
 cmd_stop() {
   step "Stopping n8n"
   local cf; cf="$(compose_file)"
@@ -673,7 +1004,9 @@ cmd_stop() {
   docker compose -f "$cf" down && success "All containers stopped." || error "Stop failed."
 }
 
-# ─── COMMAND: restart ─────────────────────────────────────────────────────────
+# =============================================================================
+#  COMMAND: restart
+# =============================================================================
 cmd_restart() {
   step "Restarting n8n"
   local cf; cf="$(compose_file)"
@@ -681,49 +1014,34 @@ cmd_restart() {
   docker compose -f "$cf" restart && success "Restarted." || error "Restart failed."
 }
 
-# ─── COMMAND: update ──────────────────────────────────────────────────────────
-#
-#  Presents an interactive picker of the latest 10 n8n releases from Docker Hub.
-#  The currently installed version is highlighted. Versions newer than the
-#  currently installed one are marked with ↑. The user selects a version
-#  (which may be newer, the same, or older — downgrade is supported with a
-#  warning and explicit confirmation). A backup is created automatically before
-#  any change is applied.
-#
-#  Flags:
-#    -f   Skip confirmation prompts (non-interactive / CI use)
-#    -r   Enable auto-restart policy in the updated compose file
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+#  COMMAND: update
+#  Presents an interactive picker of the 10 most recent stable releases.
+#  Installed version highlighted; newer versions marked with ↑.
+#  Supports upgrade, re-install, or downgrade (downgrade requires confirmation).
+#  Automatic backup before any change.
+# =============================================================================
 cmd_update() {
   step "n8n — interactive version update"
   check_prerequisites
+  require_http_client update
   acquire_lock
 
   pick_n8n_version 10
   apply_n8n_version "$SELECTED_VERSION"
 }
 
-# ─── COMMAND: upgrade ─────────────────────────────────────────────────────────
-#
-#  Non-interactive fast-path: fetches the single latest stable release from
-#  Docker Hub and installs it if it is newer than what is currently deployed.
-#
-#  Behaviour:
-#    • Already on latest  → reports current version, exits cleanly.
-#    • Newer available    → shows current → latest diff, confirms (unless -f),
-#                           backs up, pulls, and redeploys.
-#
-#  This is intentionally distinct from 'update':
-#    • upgrade = "just take me to the latest, no version picker needed"
-#    • update  = "show me 10 versions and let me choose"
-#
-#  Flags:
-#    -f   Skip confirmation prompt (non-interactive / cron-safe)
-#    -r   Enable auto-restart in compose file after upgrade
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+#  COMMAND: upgrade
+#  Non-interactive fast-path: installs the single latest stable release.
+#  • Already on latest → exits cleanly.
+#  • Newer available   → shows diff, confirms (unless -f), backs up, redeploys.
+#  Ideal for cron:  deploy-n8n.sh upgrade -f -r
+# =============================================================================
 cmd_upgrade() {
   step "n8n — upgrade to latest"
   check_prerequisites
+  require_http_client upgrade
   acquire_lock
 
   local current; current=$(get_current_deployed_version)
@@ -738,13 +1056,13 @@ cmd_upgrade() {
   echo ""
 
   if [ "$current" = "$latest" ]; then
-    success "You are already on the latest version (${GREEN}${latest}${NC}). Nothing to do."
+    success "Already on the latest version (${GREEN}${latest}${NC}). Nothing to do."
     return 0
   fi
 
   if ! version_gt "$latest" "$current" && [ "$current" != "unknown" ]; then
-    warn "The latest published tag (${latest}) is not newer than your installed version (${current})."
-    warn "This can happen if Docker Hub indexing is lagged. No changes applied."
+    warn "Latest published tag (${latest}) is not newer than installed (${current})."
+    warn "Docker Hub indexing may be lagged. No changes applied."
     return 0
   fi
 
@@ -761,7 +1079,9 @@ cmd_upgrade() {
   apply_n8n_version "$latest"
 }
 
-# ─── COMMAND: reset ───────────────────────────────────────────────────────────
+# =============================================================================
+#  COMMAND: reset
+# =============================================================================
 cmd_reset() {
   step "Resetting n8n (wipe all data)"
   warn "This will PERMANENTLY delete all n8n workflows, credentials, and executions."
@@ -782,7 +1102,9 @@ cmd_reset() {
   success "Reset complete. Run '${SCRIPT_NAME} start' for a fresh instance."
 }
 
-# ─── COMMAND: uninstall ───────────────────────────────────────────────────────
+# =============================================================================
+#  COMMAND: uninstall
+# =============================================================================
 cmd_uninstall() {
   step "Uninstalling n8n"
   warn "This removes all containers, images, the data volume, and all deploy config."
@@ -801,33 +1123,33 @@ cmd_uninstall() {
   success "n8n fully uninstalled."
 }
 
-# ─── COMMAND: start ───────────────────────────────────────────────────────────
+# =============================================================================
+#  COMMAND: start
+# =============================================================================
 cmd_start() {
   step "Starting n8n"
   check_prerequisites
   load_config
   acquire_lock
 
-  # Detect version — fast by default, skip entirely with -s
   if [ "$SKIP_UPDATE" = true ]; then
     info "Detecting n8n version (skip-update mode)..."
   else
     info "Detecting n8n version..."
-    # Pull :latest only when auto-update requested OR no local image exists
     if [ "$AUTO_UPDATE" = true ] || \
        [ -z "$(docker images -q docker.n8n.io/n8nio/n8n:latest 2>/dev/null)" ]; then
       info "Pulling latest n8n image..."
       docker pull docker.n8n.io/n8nio/n8n:latest &>/dev/null
     fi
   fi
+
   local ver; ver=$(detect_n8n_version)
   info "n8n version: ${GREEN}${ver}${NC}"
 
   local n8n_image="docker.n8n.io/n8nio/n8n:${ver}"
   local runners_image="docker.io/n8nio/runners:${ver}"
 
-  # Pull / update images
-  local cached_n8n; cached_n8n=$(docker images -q "$n8n_image" 2>/dev/null || true)
+  local cached_n8n;     cached_n8n=$(docker images -q "$n8n_image" 2>/dev/null || true)
   local cached_runners; cached_runners=$(docker images -q "$runners_image" 2>/dev/null || true)
 
   if [ "$AUTO_UPDATE" = true ] || [ -z "$cached_n8n" ] || [ -z "$cached_runners" ]; then
@@ -850,26 +1172,21 @@ cmd_start() {
     fi
   fi
 
-  # Auth token
   local auth_token; auth_token=$(ensure_runner_token)
 
-  # Restart policy
   local restart_policy="no"
   [ "$AUTO_RESTART" = true ] && restart_policy="unless-stopped"
 
-  # Basic auth prompt
   if [ "$BASIC_AUTH" = true ] && [ -z "$BASIC_AUTH_USER" ]; then
-    read -rp "Basic auth username: " BASIC_AUTH_USER
+    read -rp  "Basic auth username: " BASIC_AUTH_USER
     read -rsp "Basic auth password: " BASIC_AUTH_PASS
     echo ""
   fi
 
-  # Write compose + persist config (including cached version)
   write_compose "$n8n_image" "$runners_image" "$auth_token" "$restart_policy"
   N8N_CACHED_VERSION="$ver"
   save_config
 
-  # Handle name conflicts
   if docker ps -aq -f "name=^/${CONTAINER_NAME}$" | grep -q .; then
     if [ "$FORCE" = true ] || [ "$AUTO_UPDATE" = true ]; then
       info "Removing existing container '${CONTAINER_NAME}'..."
@@ -878,20 +1195,20 @@ cmd_start() {
       warn "Container '${CONTAINER_NAME}' already exists."
       select choice in "Stop and Replace" "Cancel"; do
         case $choice in
-          "Stop and Replace") docker compose -f "$(compose_file)" down 2>/dev/null || docker rm -f "$CONTAINER_NAME"; break ;;
+          "Stop and Replace")
+            docker compose -f "$(compose_file)" down 2>/dev/null || docker rm -f "$CONTAINER_NAME"
+            break ;;
           "Cancel") exit 0 ;;
         esac
       done
     fi
   fi
 
-  # Ensure volume
   docker volume inspect "$VOLUME_NAME" &>/dev/null || {
     info "Creating volume: ${VOLUME_NAME}"
     docker volume create "$VOLUME_NAME"
   }
 
-  # Launch
   info "Launching n8n v${ver} on port ${HOST_PORT}..."
 
   if [ "$DETACHED" = true ]; then
@@ -912,7 +1229,9 @@ cmd_start() {
   fi
 }
 
-# ─── Usage ────────────────────────────────────────────────────────────────────
+# =============================================================================
+#  USAGE
+# =============================================================================
 usage() {
   cat <<EOF
 
@@ -937,18 +1256,17 @@ ${BOLD}COMMANDS${NC}
 
 ${BOLD}UPDATE vs UPGRADE${NC}
   ${BOLD}update${NC}
-    Presents a numbered list of the 10 most recent stable n8n releases
-    fetched live from Docker Hub. Your currently installed version is
-    highlighted (${GREEN}▶${NC}), and versions newer than yours are marked (${CYAN}↑${NC}).
-    You choose the exact version to install — which may be an upgrade,
-    a re-install of the same version, or a downgrade (with confirmation).
-    A backup is always created automatically before any change.
+    Presents a numbered list of the 10 most-recent stable n8n releases
+    fetched live from Docker Hub. Your installed version is highlighted
+    (${GREEN}▶${NC}), versions newer than yours are marked (${CYAN}↑${NC}). Choose any version
+    to install — upgrade, re-install, or downgrade (with confirmation).
+    A backup is created automatically before any change is applied.
 
   ${BOLD}upgrade${NC}
-    Fetches only the single latest release. If you are already on it,
-    it exits cleanly. Otherwise it shows the current → target diff,
-    asks for confirmation (unless -f), backs up, and redeploys. Ideal
-    for cron jobs and CI pipelines: ${DIM}${SCRIPT_NAME} upgrade -f -r${NC}
+    Fetches only the single latest release and installs it if it is newer
+    than the currently deployed version. Already on latest → exits cleanly.
+    Shows a current→target diff, asks for confirmation (unless -f), backs
+    up, then redeploys. Ideal for cron: ${DIM}${SCRIPT_NAME} upgrade -f -r${NC}
 
 ${BOLD}OPTIONS${NC}
   -s            Skip update check — start instantly using cached version
@@ -958,12 +1276,42 @@ ${BOLD}OPTIONS${NC}
   -f            Force — skip confirmation prompts (useful for CI/CD)
   -n NAME       Container name              (default: n8n)
   -p PORT       Host port to expose         (default: 5678)
-  -t TIMEZONE   Container timezone          (default: system timezone)
+  -t TIMEZONE   Container timezone          (default: auto-detected)
   -e FILE       Path to a .env file with extra environment variables
   -w URL        Webhook base URL            (e.g. https://n8n.example.com)
   -b            Enable HTTP basic auth (will prompt for credentials)
   -l LEVEL      Log level: error | warn | info | debug  (default: info)
   -h            Show this help message
+
+${BOLD}PLATFORM COMPATIBILITY${NC}
+  Linux families:
+    Debian/Ubuntu  Fedora/RHEL/Rocky/AlmaLinux  openSUSE/SLES
+    Arch/Manjaro   Alpine   Void   Gentoo   Slackware
+    NixOS   Solus  Puppy   and most independent distros
+
+  macOS:
+    Ventura 13+ · Sonoma 14+ · Sequoia 15+  (Intel + Apple Silicon)
+
+  Hard requirements (must be present on the host):
+    bash ≥ 3.2 · docker (Compose v2 plugin) · openssl
+
+  Soft requirements (needed only for 'update' / 'upgrade'):
+    curl or wget   — Docker Hub API calls
+    jq or python3  — JSON parsing  (grep fallback also works)
+    gsort (macOS)  — Accurate semver comparison (brew install coreutils)
+
+  Alpine Linux note:
+    Alpine ships ash, not bash. Install bash first:
+    ${DIM}apk add bash docker docker-cli-compose openssl${NC}
+    Then run the script with: ${DIM}bash ${SCRIPT_NAME} ...${NC}
+
+  NixOS note:
+    Ensure services.docker.enable = true in configuration.nix and
+    your user is in the docker group before running this script.
+
+  macOS note:
+    Docker Desktop must be running before any command is issued.
+    For accurate semver comparison: ${DIM}brew install coreutils${NC}
 
 ${BOLD}EXAMPLES${NC}
   # Quick local start — interactive foreground mode
@@ -987,10 +1335,7 @@ ${BOLD}EXAMPLES${NC}
   # Interactive version picker — see 10 recent releases, choose one to install
   ${DIM}${SCRIPT_NAME} update${NC}
 
-  # Non-interactive update (CI/CD — picks interactively, but -f skips confirmations)
-  ${DIM}${SCRIPT_NAME} update -f${NC}
-
-  # One-click upgrade to the absolute latest (asks for confirmation)
+  # One-click upgrade to the latest (asks for confirmation)
   ${DIM}${SCRIPT_NAME} upgrade${NC}
 
   # Fully automated upgrade — ideal for cron, no prompts, auto-restart enabled
@@ -1002,7 +1347,7 @@ ${BOLD}EXAMPLES${NC}
   # Stream logs from only the main n8n container
   ${DIM}${SCRIPT_NAME} logs n8n${NC}
 
-  # Show deployment status, volume size, backup count, and installed version
+  # Show deployment status, version, platform, and backup count
   ${DIM}${SCRIPT_NAME} status${NC}
 
   # Create a backup snapshot
@@ -1036,8 +1381,8 @@ ${BOLD}NOTES${NC}
   • The task broker port (5679) is bound to 127.0.0.1 only and is never
     exposed publicly — the runner container reaches it via the internal
     Docker network.
-  • Backups are standard tar.gz archives of the Docker volume. You can
-    restore them manually with any tool, independent of this script.
+  • Backups are standard tar.gz archives of the Docker volume. They can
+    be restored manually with any tool, independent of this script.
   • Settings (port, name, timezone, etc.) are persisted in .config and
     reloaded automatically on subsequent runs.
   • Ollama (host machine): both containers have host.docker.internal
@@ -1046,16 +1391,21 @@ ${BOLD}NOTES${NC}
   • Update speed: first run detects the version via docker inspect (fast)
     or docker run (slow, one-time fallback). Use -s on subsequent starts
     to skip all version/update checks and launch instantly.
-  • The 'update' version list requires network access to Docker Hub
-    (api.docker.io). curl or wget must be available on the host.
-  • Downgrading is supported via 'update' but requires explicit confirmation
-    and is not available via 'upgrade' (which only moves forward).
+  • Timezone is auto-detected via /etc/timezone · /etc/localtime symlink ·
+    timedatectl · systemsetup (macOS) · /etc/sysconfig/clock — in that order.
+    Override at any time with: ${SCRIPT_NAME} start -t America/New_York
+  • realpath is resolved via: GNU realpath → grealpath (macOS brew) →
+    python3 → python2 → pure-bash absolute path conversion.
+  • semver comparison uses: GNU sort -V → gsort (brew coreutils) →
+    python3 → python2 → pure-bash integer comparison.
 
 EOF
   exit 0
 }
 
-# ─── Parse global options ─────────────────────────────────────────────────────
+# =============================================================================
+#  PARSE OPTIONS
+# =============================================================================
 parse_opts() {
   while getopts "sudfrbn:p:t:e:w:l:h" opt; do
     case "$opt" in
@@ -1077,7 +1427,9 @@ parse_opts() {
   done
 }
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
+# =============================================================================
+#  ENTRY POINT
+# =============================================================================
 main() {
   local command="${1:-start}"
 
@@ -1098,13 +1450,11 @@ main() {
       shift 2>/dev/null || true
       local restore_file="${1:-}"
       load_config
-      # -f may be passed after the subcommand
       [[ "${1:-}" == "-f" ]] && { FORCE=true; shift; }
       cmd_restore "$restore_file"
       return
       ;;
     -*)
-      # No subcommand given — treat all args as options to 'start'
       command="start"
       parse_opts "$@"
       ;;
